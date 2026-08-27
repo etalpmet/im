@@ -422,6 +422,25 @@ checkout_linked_branch() {
   fi
 }
 
+pull_base_branch() {
+  local branch_name="$1"
+  local current_branch pull_exit
+
+  current_branch="$(git branch --show-current)"
+  [[ "$current_branch" == "$branch_name" ]] \
+    || fail "expected checked out branch $branch_name, got ${current_branch:-detached HEAD}"
+
+  echo "Pulling latest $REMOTE/$BASE_BRANCH into $branch_name..."
+  if git pull --ff-only "$REMOTE" "$BASE_BRANCH"; then
+    echo "Branch is up to date with $REMOTE/$BASE_BRANCH."
+  else
+    pull_exit=$?
+    echo "Could not fast-forward $branch_name from $REMOTE/$BASE_BRANCH." >&2
+    echo "Resolve the branch state, then retry: git pull --ff-only $REMOTE $BASE_BRANCH" >&2
+    return "$pull_exit"
+  fi
+}
+
 branch_label_for_issue() {
   local issue_number="$1"
   local issue_labels label configured_label
@@ -562,6 +581,7 @@ new_branch() {
     --base "$BASE_BRANCH" \
     --name "$branch_name" \
     --checkout
+  pull_base_branch "$branch_name"
   echo "Assigning issue #$issue_number to you and adding $WORK_LABEL label"
   gh issue edit "$issue_number" --add-assignee @me --add-label "$WORK_LABEL"
   write_issue_context "$issue_number" "$branch_name"
@@ -702,6 +722,7 @@ new_issue() {
     return "$branch_exit"
   fi
 
+  pull_base_branch "$branch_name"
   echo "Adding $WORK_LABEL label to issue #$issue_number"
   gh issue edit "$issue_number" --add-label "$WORK_LABEL"
   write_issue_context "$issue_number" "$branch_name"
