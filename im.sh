@@ -10,6 +10,7 @@ BRANCH_DEFAULT=
 WORK_LABEL=
 TEST_SCRIPT=
 BRANCH_LABELS=()
+ISSUE_CONTEXT_DIR=im-issue
 
 usage() {
   cat <<'EOF'
@@ -441,12 +442,95 @@ branch_label_for_issue() {
   esac
 }
 
+issue_context_filename() {
+  local issue_number="$1"
+  local issue_title="$2"
+  local safe_title
+
+  safe_title="$(
+    printf '%s' "$issue_title" \
+      | tr '\r\n\t' '   ' \
+      | sed -E 's#[/\\:*?"<>|]+#-#g; s/[[:space:]]+/ /g; s/^ +//; s/[ .]+$//' \
+      | cut -c1-120 \
+      | sed -E 's/[ .]+$//'
+  )"
+  [[ -n "$safe_title" ]] || safe_title=issue
+  printf '%s-%s.md\n' "$issue_number" "$safe_title"
+}
+
+write_issue_context() {
+  local requested_issue_number="$1"
+  local branch_name="$2"
+  local issue_details issue_number issue_title issue_state issue_url issue_updated
+  local issue_assignees issue_labels issue_milestone issue_body context_file
+
+  require_issue_context_ignored
+  issue_details="$(
+    gh issue view "$requested_issue_number" \
+      --json number,title,state,url,updatedAt,assignees,labels,milestone,body \
+      --jq '[(.number | tostring), .title, .state, .url, .updatedAt, ([.assignees[].login | "@" + .] | join(", ")), ([.labels[].name] | join(", ")), (.milestone.title // ""), (.body // "")] | join("\u001f")'
+  )"
+
+  issue_number="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_title="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_state="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_url="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_updated="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_assignees="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_labels="${issue_details%%$'\x1f'*}"
+  issue_details="${issue_details#*$'\x1f'}"
+  issue_milestone="${issue_details%%$'\x1f'*}"
+  issue_body="${issue_details#*$'\x1f'}"
+
+  [[ "$issue_number" == "$requested_issue_number" ]] \
+    || fail "GitHub returned issue #$issue_number while #$requested_issue_number was requested"
+  context_file="$REPO_ROOT/$ISSUE_CONTEXT_DIR/$(
+    issue_context_filename "$issue_number" "$issue_title"
+  )"
+  mkdir -p "$REPO_ROOT/$ISSUE_CONTEXT_DIR" \
+    || fail "could not create issue context directory: $REPO_ROOT/$ISSUE_CONTEXT_DIR"
+
+  if ! {
+    printf '# #%s %s\n\n' "$issue_number" "$issue_title"
+    printf -- '- State: %s\n' "$issue_state"
+    printf -- '- URL: %s\n' "$issue_url"
+    printf -- '- Branch: %s\n' "$branch_name"
+    printf -- '- Assignees: %s\n' "${issue_assignees:-unassigned}"
+    printf -- '- Labels: %s\n' "${issue_labels:-none}"
+    printf -- '- Milestone: %s\n' "${issue_milestone:-none}"
+    printf -- '- Updated: %s\n' "$issue_updated"
+    printf '\n## Description\n\n'
+    if [[ -n "$issue_body" ]]; then
+      printf '%s\n' "$issue_body"
+    else
+      printf '_No description provided._\n'
+    fi
+  } >"$context_file"; then
+    fail "could not write issue context: $context_file"
+  fi
+
+  echo "Issue context:"
+  echo "  Issue:     #$issue_number $issue_title"
+  echo "  State:     $issue_state"
+  echo "  Assignees: ${issue_assignees:-unassigned}"
+  echo "  Labels:    ${issue_labels:-none}"
+  echo "  Milestone: ${issue_milestone:-none}"
+  echo "  Context:   $context_file"
+}
+
 new_branch() {
   local only_me="${1:-false}"
   local by_milestone="${2:-false}"
   local milestone_number='' issue_number linked_rows linked_branch issue_label issue_title branch_name
 
   require_clean_worktree
+  require_issue_context_ignored
   if [[ "$by_milestone" == true ]]; then
     if ! milestone_number="$(choose_milestone)"; then
       return
@@ -464,6 +548,7 @@ new_branch() {
     fi
     echo "Checking out linked branch: $linked_branch"
     checkout_linked_branch "$linked_branch"
+    write_issue_context "$issue_number" "$linked_branch"
     return
   fi
 
@@ -479,6 +564,7 @@ new_branch() {
     --checkout
   echo "Assigning issue #$issue_number to you and adding $WORK_LABEL label"
   gh issue edit "$issue_number" --add-assignee @me --add-label "$WORK_LABEL"
+  write_issue_context "$issue_number" "$branch_name"
 }
 
 new_issue() {
@@ -562,6 +648,7 @@ new_issue() {
 
   if [[ "$checkout_branch" == true ]]; then
     require_clean_worktree
+    require_issue_context_ignored
     current_branch="$(git branch --show-current)"
     [[ -n "$current_branch" ]] || fail "detached HEAD is not supported"
     echo "Current branch is clean: $current_branch"
@@ -617,6 +704,7 @@ new_issue() {
 
   echo "Adding $WORK_LABEL label to issue #$issue_number"
   gh issue edit "$issue_number" --add-label "$WORK_LABEL"
+  write_issue_context "$issue_number" "$branch_name"
 }
 
 issue_number_from_branch() {
@@ -795,6 +883,47 @@ confirm_default_yes() {
   esac
 }
 
+gitignore_has_issue_context() {
+  local gitignore_file="$REPO_ROOT/.gitignore"
+  local line
+
+  [[ -f "$gitignore_file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim_value "${line%$'\r'}")"
+    case "$line" in
+      "$ISSUE_CONTEXT_DIR/" | "/$ISSUE_CONTEXT_DIR/") return ;;
+    esac
+  done <"$gitignore_file"
+  return 1
+}
+
+setup_issue_context_gitignore() {
+  local gitignore_file="$REPO_ROOT/.gitignore"
+
+  if gitignore_has_issue_context; then
+    echo "$ISSUE_CONTEXT_DIR/ is already listed in $gitignore_file"
+    return
+  fi
+
+  if ! confirm_default_yes "Add $ISSUE_CONTEXT_DIR/ to $gitignore_file?"; then
+    echo "$ISSUE_CONTEXT_DIR/ was not added to .gitignore."
+    return
+  fi
+
+  [[ ! -e "$gitignore_file" || -f "$gitignore_file" ]] \
+    || fail "cannot update .gitignore because it is not a regular file: $gitignore_file"
+  if [[ -s "$gitignore_file" && -n "$(tail -c 1 "$gitignore_file")" ]]; then
+    printf '\n' >>"$gitignore_file"
+  fi
+  printf '%s/\n' "$ISSUE_CONTEXT_DIR" >>"$gitignore_file"
+  echo "Added $ISSUE_CONTEXT_DIR/ to $gitignore_file"
+}
+
+require_issue_context_ignored() {
+  gitignore_has_issue_context \
+    || fail "$ISSUE_CONTEXT_DIR/ is not listed in $REPO_ROOT/.gitignore. Run: im.sh init"
+}
+
 github_label_exists() {
   local requested_label="$1"
   local existing_labels="$2"
@@ -842,7 +971,7 @@ setup_github_labels() {
       echo "GitHub label created: $label"
       existing_labels+=$'\n'"$label"
     else
-      fail ".imconfig was created, but GitHub label creation failed: $label"
+      fail "GitHub label creation failed: $label"
     fi
   done
 }
@@ -850,43 +979,56 @@ setup_github_labels() {
 init_project() {
   local labels_display=
   local label
+  local config_created=false
 
   require_git
   find_repository
-  [[ ! -e "$CONFIG_FILE" ]] \
-    || fail ".imconfig already exists: $CONFIG_FILE"
+  echo "Initializing im for: $REPO_ROOT"
+  if [[ -e "$CONFIG_FILE" ]]; then
+    [[ -f "$CONFIG_FILE" ]] \
+      || fail ".imconfig is not a regular file: $CONFIG_FILE"
+    load_config
+    echo "Using existing .imconfig: $CONFIG_FILE"
+  else
+    config_created=true
+  fi
+
   require_github
 
-  echo "Initializing im for: $REPO_ROOT"
-  BASE_BRANCH="$(prompt_with_default "Base branch" main)" \
-    || fail "initialization cancelled"
-  REMOTE="$(prompt_with_default "Git remote" origin)" \
-    || fail "initialization cancelled"
-  BRANCH_ALLOWED="$(prompt_with_default "Allowed branch labels" bug,feature)" \
-    || fail "initialization cancelled"
-  BRANCH_DEFAULT="$(prompt_with_default "Default branch label" feature)" \
-    || fail "initialization cancelled"
-  WORK_LABEL="$(prompt_with_default "Work-in-progress label" TAKEN)" \
-    || fail "initialization cancelled"
-  TEST_SCRIPT="$(prompt_with_default "Integration test script" scripts/run-integration-tests.sh)" \
-    || fail "initialization cancelled"
+  if [[ "$config_created" == true ]]; then
+    BASE_BRANCH="$(prompt_with_default "Base branch" main)" \
+      || fail "initialization cancelled"
+    REMOTE="$(prompt_with_default "Git remote" origin)" \
+      || fail "initialization cancelled"
+    BRANCH_ALLOWED="$(prompt_with_default "Allowed branch labels" bug,feature)" \
+      || fail "initialization cancelled"
+    BRANCH_DEFAULT="$(prompt_with_default "Default branch label" feature)" \
+      || fail "initialization cancelled"
+    WORK_LABEL="$(prompt_with_default "Work-in-progress label" TAKEN)" \
+      || fail "initialization cancelled"
+    TEST_SCRIPT="$(prompt_with_default "Integration test script" scripts/run-integration-tests.sh)" \
+      || fail "initialization cancelled"
 
-  validate_config
+    validate_config
 
-  {
-    printf '# im project configuration\n'
-    printf 'base_branch=%s\n' "$BASE_BRANCH"
-    printf 'remote=%s\n' "$REMOTE"
-    printf 'branch_allowed=%s\n' "$BRANCH_ALLOWED"
-    printf 'branch_default=%s\n' "$BRANCH_DEFAULT"
-    printf 'work_label=%s\n' "$WORK_LABEL"
-    printf 'test_script=%s\n' "$TEST_SCRIPT"
-  } >"$CONFIG_FILE"
+    {
+      printf '# im project configuration\n'
+      printf 'base_branch=%s\n' "$BASE_BRANCH"
+      printf 'remote=%s\n' "$REMOTE"
+      printf 'branch_allowed=%s\n' "$BRANCH_ALLOWED"
+      printf 'branch_default=%s\n' "$BRANCH_DEFAULT"
+      printf 'work_label=%s\n' "$WORK_LABEL"
+      printf 'test_script=%s\n' "$TEST_SCRIPT"
+    } >"$CONFIG_FILE"
 
-  echo ".imconfig created: $CONFIG_FILE"
+    echo ".imconfig created: $CONFIG_FILE"
+  fi
+
   if [[ ! -f "$REPO_ROOT/$TEST_SCRIPT" ]]; then
     echo "NOTICE: Test script was not found: $REPO_ROOT/$TEST_SCRIPT"
   fi
+
+  setup_issue_context_gitignore
 
   for label in "${BRANCH_LABELS[@]}" "$WORK_LABEL"; do
     if [[ -n "$labels_display" ]]; then
@@ -899,7 +1041,9 @@ init_project() {
   else
     echo "GitHub label setup skipped."
   fi
-  echo "Commit .imconfig before using branch or pull request commands."
+  if [[ "$config_created" == true ]]; then
+    echo "Commit .imconfig before using branch or pull request commands."
+  fi
 }
 
 main_menu() {
