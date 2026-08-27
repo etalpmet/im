@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT=
+CONFIG_FILE=
+BASE_BRANCH=
+REMOTE=
+BRANCH_ALLOWED=
+BRANCH_DEFAULT=
+WORK_LABEL=
+TEST_SCRIPT=
+BRANCH_LABELS=()
 
 usage() {
   cat <<'EOF'
@@ -17,6 +25,7 @@ Usage:
   ./im.sh pr           Test the current branch and create a pull request
   ./im.sh pr --skip-tests
                        Create a pull request without running tests
+  ./im.sh init         Create .imconfig and optionally set up GitHub labels
   ./im.sh help         Show this help
 EOF
 }
@@ -27,13 +36,175 @@ fail() {
 }
 
 require_command() {
-  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+  local command_name="$1"
+  local install_name="$2"
+
+  command -v "$command_name" >/dev/null 2>&1 \
+    || fail "$install_name is not installed. Install it and retry."
+}
+
+require_git() {
+  require_command git Git
 }
 
 require_github() {
-  require_command gh
+  local answer
+
+  require_command gh "GitHub CLI (gh)"
+  if gh auth status --hostname github.com >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ ! -t 0 ]]; then
+    fail "GitHub CLI is not authenticated. Run: gh auth login --hostname github.com"
+  fi
+
+  printf 'GitHub CLI is not authenticated. Log in now? [Y/n] ' >&2
+  if ! IFS= read -r answer; then
+    fail "GitHub CLI authentication is required"
+  fi
+  case "$answer" in
+    '' | y | Y | yes | YES | Yes)
+      gh auth login --hostname github.com \
+        || fail "GitHub CLI authentication failed"
+      ;;
+    *) fail "GitHub CLI authentication is required. Run: gh auth login --hostname github.com" ;;
+  esac
+
   gh auth status --hostname github.com >/dev/null 2>&1 \
-    || fail "GitHub CLI is not authenticated. Run: gh auth login --hostname github.com"
+    || fail "GitHub CLI authentication could not be verified"
+}
+
+trim_value() {
+  local value="$1"
+
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+find_repository() {
+  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
+    || fail "current directory is not inside a Git repository"
+  CONFIG_FILE="$REPO_ROOT/.imconfig"
+}
+
+configured_branch_label() {
+  local candidate
+  local normalized
+  local allowed
+
+  candidate="$1"
+  normalized="$(printf '%s' "$candidate" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  for allowed in "${BRANCH_LABELS[@]}"; do
+    if [[ "$normalized" == "$allowed" ]]; then
+      printf '%s\n' "$allowed"
+      return
+    fi
+  done
+  return 1
+}
+
+validate_config() {
+  local raw_label label existing_label
+  local default_found=false
+  local configured_labels=()
+
+  [[ -n "$BASE_BRANCH" ]] || fail "invalid $CONFIG_FILE: base_branch is required"
+  [[ -n "$REMOTE" ]] || fail "invalid $CONFIG_FILE: remote is required"
+  [[ -n "$BRANCH_ALLOWED" ]] || fail "invalid $CONFIG_FILE: branch_allowed is required"
+  [[ -n "$BRANCH_DEFAULT" ]] || fail "invalid $CONFIG_FILE: branch_default is required"
+  [[ -n "$WORK_LABEL" ]] || fail "invalid $CONFIG_FILE: work_label is required"
+  [[ -n "$TEST_SCRIPT" ]] || fail "invalid $CONFIG_FILE: test_script is required"
+
+  git check-ref-format --branch "$BASE_BRANCH" >/dev/null 2>&1 \
+    || fail "invalid $CONFIG_FILE: invalid base_branch: $BASE_BRANCH"
+  git remote get-url "$REMOTE" >/dev/null 2>&1 \
+    || fail "invalid $CONFIG_FILE: Git remote not found: $REMOTE"
+
+  IFS=',' read -r -a configured_labels <<<"$BRANCH_ALLOWED"
+  BRANCH_LABELS=()
+  for raw_label in "${configured_labels[@]}"; do
+    label="$(trim_value "$raw_label")"
+    [[ -n "$label" ]] \
+      || fail "invalid $CONFIG_FILE: branch_allowed contains an empty label"
+    [[ "$label" =~ ^[a-z0-9][a-z0-9._-]*$ ]] \
+      || fail "invalid $CONFIG_FILE: branch label must match [a-z0-9][a-z0-9._-]*: $label"
+    if [[ "${#BRANCH_LABELS[@]}" -gt 0 ]]; then
+      for existing_label in "${BRANCH_LABELS[@]}"; do
+        [[ "$existing_label" != "$label" ]] \
+          || fail "invalid $CONFIG_FILE: duplicate branch label: $label"
+      done
+    fi
+    BRANCH_LABELS+=("$label")
+  done
+
+  for label in "${BRANCH_LABELS[@]}"; do
+    if [[ "$label" == "$BRANCH_DEFAULT" ]]; then
+      default_found=true
+      break
+    fi
+  done
+  [[ "$default_found" == true ]] \
+    || fail "invalid $CONFIG_FILE: branch_default must be listed in branch_allowed"
+
+  [[ "$TEST_SCRIPT" != /* ]] \
+    || fail "invalid $CONFIG_FILE: test_script must be relative to the repository root"
+  case "/$TEST_SCRIPT/" in
+    */../*) fail "invalid $CONFIG_FILE: test_script cannot leave the repository root" ;;
+  esac
+}
+
+load_config() {
+  local line line_number=0 key value
+  local seen_keys=' '
+
+  [[ -f "$CONFIG_FILE" ]] \
+    || fail ".imconfig was not found in the repository root. Run: im.sh init"
+
+  BASE_BRANCH=
+  REMOTE=
+  BRANCH_ALLOWED=
+  BRANCH_DEFAULT=
+  WORK_LABEL=
+  TEST_SCRIPT=
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == *=* ]] \
+      || fail "invalid $CONFIG_FILE:$line_number: expected key=value"
+
+    key="$(trim_value "${line%%=*}")"
+    value="$(trim_value "${line#*=}")"
+    case "$key" in
+      base_branch | remote | branch_allowed | branch_default | work_label | test_script) ;;
+      *) fail "invalid $CONFIG_FILE:$line_number: unknown key: $key" ;;
+    esac
+    [[ "$seen_keys" != *" $key "* ]] \
+      || fail "invalid $CONFIG_FILE:$line_number: duplicate key: $key"
+    seen_keys+="$key "
+
+    case "$key" in
+      base_branch) BASE_BRANCH="$value" ;;
+      remote) REMOTE="$value" ;;
+      branch_allowed) BRANCH_ALLOWED="$value" ;;
+      branch_default) BRANCH_DEFAULT="$value" ;;
+      work_label) WORK_LABEL="$value" ;;
+      test_script) TEST_SCRIPT="$value" ;;
+    esac
+  done <"$CONFIG_FILE"
+
+  validate_config
+}
+
+prepare_project() {
+  require_git
+  find_repository
+  load_config
+  require_github
 }
 
 require_clean_worktree() {
@@ -212,10 +383,10 @@ choose_milestone() {
 
 choose_linked_branch() {
   local rows="$1"
-  local row branch url choice
+  local branch _url choice
   local branches=()
 
-  while IFS=$'\t' read -r branch url; do
+  while IFS=$'\t' read -r branch _url; do
     [[ -n "$branch" ]] || continue
     branches+=("$branch")
   done <<<"$rows"
@@ -242,22 +413,40 @@ choose_linked_branch() {
 checkout_linked_branch() {
   local branch="$1"
 
-  git fetch origin "$branch"
+  git fetch "$REMOTE" "$branch"
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     git switch "$branch"
   else
-    git switch --create "$branch" --track "origin/$branch"
+    git switch --create "$branch" --track "$REMOTE/$branch"
   fi
+}
+
+branch_label_for_issue() {
+  local issue_number="$1"
+  local issue_labels label configured_label
+  local matches=()
+
+  issue_labels="$(gh issue view "$issue_number" --json labels --jq '.labels[].name')"
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    if configured_label="$(configured_branch_label "$label")"; then
+      matches+=("$configured_label")
+    fi
+  done <<<"$issue_labels"
+
+  case "${#matches[@]}" in
+    0) printf '%s\n' "$BRANCH_DEFAULT" ;;
+    1) printf '%s\n' "${matches[0]}" ;;
+    *) fail "issue #$issue_number has multiple branch labels: ${matches[*]}" ;;
+  esac
 }
 
 new_branch() {
   local only_me="${1:-false}"
   local by_milestone="${2:-false}"
-  local milestone_number= issue_number linked_rows linked_branch issue_label issue_title branch_name
+  local milestone_number='' issue_number linked_rows linked_branch issue_label issue_title branch_name
 
   require_clean_worktree
-  require_github
-
   if [[ "$by_milestone" == true ]]; then
     if ! milestone_number="$(choose_milestone)"; then
       return
@@ -278,27 +467,18 @@ new_branch() {
     return
   fi
 
-  issue_label="$(
-    gh issue view "$issue_number" \
-      --json labels \
-      --jq '[.labels[].name | ascii_downcase | select(. == "bug" or . == "feature")] | unique | join(",")'
-  )"
-  case "$issue_label" in
-    bug | feature) ;;
-    '') issue_label=feature ;;
-    *) fail "issue #$issue_number cannot have both bug and feature labels" ;;
-  esac
+  issue_label="$(branch_label_for_issue "$issue_number")"
 
   issue_title="$(gh issue view "$issue_number" --json title --jq '.title')"
   branch_name="$issue_label/$issue_number-$(slugify "$issue_title")"
 
   echo "Creating linked branch: $branch_name"
   gh issue develop "$issue_number" \
-    --base main \
+    --base "$BASE_BRANCH" \
     --name "$branch_name" \
     --checkout
-  echo "Assigning issue #$issue_number to you and adding TAKEN label"
-  gh issue edit "$issue_number" --add-assignee @me --add-label TAKEN
+  echo "Assigning issue #$issue_number to you and adding $WORK_LABEL label"
+  gh issue edit "$issue_number" --add-assignee @me --add-label "$WORK_LABEL"
 }
 
 new_issue() {
@@ -306,7 +486,7 @@ new_issue() {
   shift
 
   local issue_title="${1:-}"
-  local issue_type=feature
+  local issue_type="$BRANCH_DEFAULT"
   local issue_assignee=@me
   local issue_description=
   local assignee_set=false
@@ -325,14 +505,12 @@ new_issue() {
       -l | --label)
         [[ $# -ge 2 ]] || fail "missing value for $1"
         [[ -n "$2" ]] || fail "issue label cannot be empty"
-        case "$2" in
-          bug | feature)
-            if [[ -n "$explicit_issue_type" && "$explicit_issue_type" != "$2" ]]; then
-              fail "issue cannot have both bug and feature labels"
-            fi
-            explicit_issue_type="$2"
-            ;;
-        esac
+        if issue_label="$(configured_branch_label "$2")"; then
+          if [[ -n "$explicit_issue_type" && "$explicit_issue_type" != "$issue_label" ]]; then
+            fail "issue cannot have multiple branch labels: $explicit_issue_type, $issue_label"
+          fi
+          explicit_issue_type="$issue_label"
+        fi
         issue_labels+=("$2")
         shift 2
         ;;
@@ -362,16 +540,18 @@ new_issue() {
     esac
   done
 
-  if [[ "${#issue_labels[@]}" -eq 0 ]]; then
-    issue_labels=(feature)
-  elif [[ -n "$explicit_issue_type" ]]; then
+  if [[ -n "$explicit_issue_type" ]]; then
     issue_type="$explicit_issue_type"
+  else
+    issue_labels+=("$BRANCH_DEFAULT")
   fi
 
   for issue_label in "${issue_labels[@]}"; do
-    for existing_label in "${unique_labels[@]}"; do
-      [[ "$existing_label" != "$issue_label" ]] || continue 2
-    done
+    if [[ "${#unique_labels[@]}" -gt 0 ]]; then
+      for existing_label in "${unique_labels[@]}"; do
+        [[ "$existing_label" != "$issue_label" ]] || continue 2
+      done
+    fi
     unique_labels+=("$issue_label")
   done
   issue_labels=("${unique_labels[@]}")
@@ -386,8 +566,6 @@ new_issue() {
     [[ -n "$current_branch" ]] || fail "detached HEAD is not supported"
     echo "Current branch is clean: $current_branch"
   fi
-  require_github
-
   echo "Creating GitHub issue:"
   echo "  Title:    $issue_title"
   labels_display="$(IFS=', '; echo "${issue_labels[*]}")"
@@ -423,9 +601,9 @@ new_issue() {
   branch_name="$issue_type/$issue_number-$(slugify "$issue_title")"
 
   echo
-  echo "Creating linked branch from main: $branch_name"
+  echo "Creating linked branch from $BASE_BRANCH: $branch_name"
   if gh issue develop "$issue_number" \
-    --base main \
+    --base "$BASE_BRANCH" \
     --name "$branch_name" \
     --checkout; then
     echo "Linked branch checked out: $branch_name"
@@ -437,16 +615,27 @@ new_issue() {
     return "$branch_exit"
   fi
 
-  echo "Adding TAKEN label to issue #$issue_number"
-  gh issue edit "$issue_number" --add-label TAKEN
+  echo "Adding $WORK_LABEL label to issue #$issue_number"
+  gh issue edit "$issue_number" --add-label "$WORK_LABEL"
 }
 
 issue_number_from_branch() {
   local branch="$1"
+  local branch_label prefix remainder issue_number
 
-  if [[ "$branch" =~ ^(bug|feature)/([0-9]+)- ]]; then
-    printf '%s\n' "${BASH_REMATCH[2]}"
-  elif [[ "$branch" =~ ^([0-9]+)- ]]; then
+  for branch_label in "${BRANCH_LABELS[@]}"; do
+    prefix="$branch_label/"
+    if [[ "$branch" == "$prefix"* ]]; then
+      remainder="${branch#"$prefix"}"
+      issue_number="${remainder%%-*}"
+      if [[ "$remainder" == "$issue_number-"* && "$issue_number" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$issue_number"
+        return
+      fi
+    fi
+  done
+
+  if [[ "$branch" =~ ^([0-9]+)- ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
   else
     fail "cannot determine issue number from branch: $branch"
@@ -456,10 +645,10 @@ issue_number_from_branch() {
 require_linked_issue() {
   local issue_number="$1"
   local current_branch="$2"
-  local rows branch url
+  local rows branch _url
 
   rows="$(gh issue develop --list "$issue_number")"
-  while IFS=$'\t' read -r branch url; do
+  while IFS=$'\t' read -r branch _url; do
     if [[ "$branch" == "$current_branch" ]]; then
       return
     fi
@@ -472,15 +661,14 @@ new_pr() {
   local skip_tests="${1:-false}"
   local current_branch issue_number issue_details issue_state issue_title existing_pr
   local test_exit push_exit pr_exit pr_url pr_body
-  local test_runner="$PROJECT_ROOT/scripts/run-integration-tests.sh"
+  local test_runner="$REPO_ROOT/$TEST_SCRIPT"
   local test_runner_missing=false
 
   require_clean_worktree
-  require_github
-
   current_branch="$(git branch --show-current)"
   [[ -n "$current_branch" ]] || fail "detached HEAD is not supported"
-  [[ "$current_branch" != main ]] || fail "cannot create a pull request from main"
+  [[ "$current_branch" != "$BASE_BRANCH" ]] \
+    || fail "cannot create a pull request from $BASE_BRANCH"
 
   issue_number="$(issue_number_from_branch "$current_branch")"
   require_linked_issue "$issue_number" "$current_branch"
@@ -496,7 +684,7 @@ new_pr() {
   echo "Preparing pull request:"
   echo "  Branch: $current_branch"
   echo "  Issue:  #$issue_number $issue_title"
-  echo "  Base:   main"
+  echo "  Base:   $BASE_BRANCH"
 
   existing_pr="$(
     gh pr list \
@@ -513,15 +701,18 @@ new_pr() {
   if [[ "$skip_tests" == true ]]; then
     echo
     echo "WARNING: Tests were skipped by request."
+    # Backticks in these formats are Markdown delimiters, not shell substitutions.
+    # shellcheck disable=SC2016
     pr_body="$(
       printf 'Closes #%s\n\n## Verification\n\n- Tests were skipped via `./im.sh pr --skip-tests`.\n' \
         "$issue_number"
     )"
   elif [[ ! -f "$test_runner" ]]; then
     test_runner_missing=true
+    # shellcheck disable=SC2016
     pr_body="$(
-      printf 'Closes #%s\n\n## Verification\n\n- Tests were not run because `scripts/run-integration-tests.sh` was not found.\n' \
-        "$issue_number"
+      printf 'Closes #%s\n\n## Verification\n\n- Tests were not run because `%s` was not found.\n' \
+        "$issue_number" "$TEST_SCRIPT"
     )"
   else
     echo
@@ -529,9 +720,10 @@ new_pr() {
     if "$test_runner"; then
       echo
       echo "Tests passed."
+      # shellcheck disable=SC2016
       pr_body="$(
-        printf 'Closes #%s\n\n## Verification\n\n- `scripts/run-integration-tests.sh`\n' \
-          "$issue_number"
+        printf 'Closes #%s\n\n## Verification\n\n- `%s`\n' \
+          "$issue_number" "$TEST_SCRIPT"
       )"
     else
       test_exit=$?
@@ -543,8 +735,8 @@ new_pr() {
   fi
 
   echo
-  echo "Pushing branch to origin..."
-  if git push --set-upstream origin "$current_branch"; then
+  echo "Pushing branch to $REMOTE..."
+  if git push --set-upstream "$REMOTE" "$current_branch"; then
     echo "Branch pushed."
   else
     push_exit=$?
@@ -557,7 +749,7 @@ new_pr() {
   echo "Creating pull request..."
   if pr_url="$(
     gh pr create \
-      --base main \
+      --base "$BASE_BRANCH" \
       --head "$current_branch" \
       --title "$issue_title" \
       --body "$pr_body"
@@ -577,6 +769,139 @@ new_pr() {
   fi
 }
 
+prompt_with_default() {
+  local prompt="$1"
+  local default_value="$2"
+  local answer
+
+  printf '%s [%s]: ' "$prompt" "$default_value" >&2
+  if ! IFS= read -r answer; then
+    return 1
+  fi
+  printf '%s\n' "${answer:-$default_value}"
+}
+
+confirm_default_yes() {
+  local prompt="$1"
+  local answer
+
+  printf '%s [Y/n] ' "$prompt" >&2
+  if ! IFS= read -r answer; then
+    return 1
+  fi
+  case "$answer" in
+    '' | y | Y | yes | YES | Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+github_label_exists() {
+  local requested_label="$1"
+  local existing_labels="$2"
+  local requested_normalized existing_label existing_normalized
+
+  requested_normalized="$(
+    printf '%s' "$requested_label" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+  )"
+  while IFS= read -r existing_label; do
+    existing_normalized="$(
+      printf '%s' "$existing_label" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+    )"
+    if [[ "$existing_normalized" == "$requested_normalized" ]]; then
+      return
+    fi
+  done <<<"$existing_labels"
+  return 1
+}
+
+setup_github_labels() {
+  local existing_labels label existing_setup_label
+  local setup_labels=()
+
+  if ! existing_labels="$(gh label list --limit 1000 --json name --jq '.[].name')"; then
+    fail "could not read GitHub labels"
+  fi
+
+  for label in "${BRANCH_LABELS[@]}" "$WORK_LABEL"; do
+    if [[ "${#setup_labels[@]}" -gt 0 ]]; then
+      for existing_setup_label in "${setup_labels[@]}"; do
+        if [[ "$existing_setup_label" == "$label" ]]; then
+          continue 2
+        fi
+      done
+    fi
+    setup_labels+=("$label")
+  done
+
+  for label in "${setup_labels[@]}"; do
+    if github_label_exists "$label" "$existing_labels"; then
+      echo "GitHub label already exists: $label"
+      continue
+    fi
+    if gh label create "$label" >/dev/null; then
+      echo "GitHub label created: $label"
+      existing_labels+=$'\n'"$label"
+    else
+      fail ".imconfig was created, but GitHub label creation failed: $label"
+    fi
+  done
+}
+
+init_project() {
+  local labels_display=
+  local label
+
+  require_git
+  find_repository
+  [[ ! -e "$CONFIG_FILE" ]] \
+    || fail ".imconfig already exists: $CONFIG_FILE"
+  require_github
+
+  echo "Initializing im for: $REPO_ROOT"
+  BASE_BRANCH="$(prompt_with_default "Base branch" main)" \
+    || fail "initialization cancelled"
+  REMOTE="$(prompt_with_default "Git remote" origin)" \
+    || fail "initialization cancelled"
+  BRANCH_ALLOWED="$(prompt_with_default "Allowed branch labels" bug,feature)" \
+    || fail "initialization cancelled"
+  BRANCH_DEFAULT="$(prompt_with_default "Default branch label" feature)" \
+    || fail "initialization cancelled"
+  WORK_LABEL="$(prompt_with_default "Work-in-progress label" TAKEN)" \
+    || fail "initialization cancelled"
+  TEST_SCRIPT="$(prompt_with_default "Integration test script" scripts/run-integration-tests.sh)" \
+    || fail "initialization cancelled"
+
+  validate_config
+
+  {
+    printf '# im project configuration\n'
+    printf 'base_branch=%s\n' "$BASE_BRANCH"
+    printf 'remote=%s\n' "$REMOTE"
+    printf 'branch_allowed=%s\n' "$BRANCH_ALLOWED"
+    printf 'branch_default=%s\n' "$BRANCH_DEFAULT"
+    printf 'work_label=%s\n' "$WORK_LABEL"
+    printf 'test_script=%s\n' "$TEST_SCRIPT"
+  } >"$CONFIG_FILE"
+
+  echo ".imconfig created: $CONFIG_FILE"
+  if [[ ! -f "$REPO_ROOT/$TEST_SCRIPT" ]]; then
+    echo "NOTICE: Test script was not found: $REPO_ROOT/$TEST_SCRIPT"
+  fi
+
+  for label in "${BRANCH_LABELS[@]}" "$WORK_LABEL"; do
+    if [[ -n "$labels_display" ]]; then
+      labels_display+=", "
+    fi
+    labels_display+="$label"
+  done
+  if confirm_default_yes "Create missing GitHub labels: $labels_display?"; then
+    setup_github_labels
+  else
+    echo "GitHub label setup skipped."
+  fi
+  echo "Commit .imconfig before using branch or pull request commands."
+}
+
 main_menu() {
   local choice
 
@@ -591,16 +916,15 @@ main_menu() {
   done
 }
 
-cd "$PROJECT_ROOT"
-require_command git
-
 case "${1:-}" in
   '')
     [[ $# -eq 0 ]] || { usage >&2; exit 1; }
+    prepare_project
     main_menu
     ;;
   b | branch)
     [[ $# -le 2 ]] || { usage >&2; exit 1; }
+    prepare_project
     case "${2:-}" in
       '') new_branch ;;
       -me | --me) new_branch true ;;
@@ -609,23 +933,31 @@ case "${1:-}" in
     ;;
   m | milestone)
     [[ $# -eq 1 ]] || { usage >&2; exit 1; }
+    prepare_project
     new_branch false true
     ;;
   i)
     shift
+    prepare_project
     new_issue false "$@"
     ;;
   ii)
     shift
+    prepare_project
     new_issue true "$@"
     ;;
   pr)
     [[ $# -le 2 ]] || { usage >&2; exit 1; }
+    prepare_project
     case "${2:-}" in
       '') new_pr ;;
       --skip-tests) new_pr true ;;
       *) usage >&2; exit 1 ;;
     esac
+    ;;
+  init)
+    [[ $# -eq 1 ]] || { usage >&2; exit 1; }
+    init_project
     ;;
   -h | --help | help)
     [[ $# -eq 1 ]] || { usage >&2; exit 1; }
